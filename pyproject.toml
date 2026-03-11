@@ -1,0 +1,30 @@
+[project]
+name = "graphiti-zep"
+version = "0.1.0"
+description = "Self-hosted Zep-compatible knowledge graph API backed by Graphiti + Neo4j"
+requires-python = ">=3.11,<3.13"
+license = "MIT"
+readme = "README.md"
+keywords = ["graphiti", "zep", "knowledge-graph", "neo4j", "llm"]
+dependencies = [
+    "anthropic>=0.49.0",
+    "fastapi>=0.115.0",
+    "graphiti-core>=0.28.1",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.4.0",
+    "uvicorn>=0.30.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+graphiti-zep = "graphiti_zep.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["graphiti_zep"]
