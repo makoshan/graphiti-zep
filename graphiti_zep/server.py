@@ -136,7 +136,7 @@ class Settings(BaseSettings):
     neo4j_uri: str = "bolt://127.0.0.1:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str
-    llm_api_style: str = "openai"
+    llm_api_style: str = "anthropic"
     llm_api_key: str
     llm_base_url: str | None = None
     llm_model_name: str | None = None

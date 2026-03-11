@@ -147,7 +147,7 @@ Copy `.env.example` to `.env`. Key settings:
 | `NEO4J_URI` | Neo4j connection URI | `bolt://127.0.0.1:7687` |
 | `NEO4J_USER` | Neo4j username | `neo4j` |
 | `NEO4J_PASSWORD` | Neo4j password | **(required)** |
-| `LLM_API_STYLE` | `openai` or `anthropic` | `openai` |
+| `LLM_API_STYLE` | `openai` or `anthropic` | `anthropic` |
 | `LLM_API_KEY` | LLM provider API key | **(required)** |
 | `LLM_BASE_URL` | LLM provider base URL | (optional) |
 | `LLM_MODEL_NAME` | Model name | (optional) |
