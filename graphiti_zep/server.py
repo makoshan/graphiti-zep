@@ -36,6 +36,22 @@ from graphiti_core.nodes import EntityNode, EpisodicNode
 
 logger = logging.getLogger(__name__)
 
+# ── Monkey-patch: auto-fill empty Edge.fact after construction ────────
+# qwen-plus sometimes returns edges without the `fact` field. The vendored
+# graphiti_core source is patched to make fact default to '', and we also
+# hook ExtractedEdges.__init__ to auto-fill empty facts from edge metadata.
+from graphiti_core.prompts.extract_edges import ExtractedEdges as _PatchExtractedEdges
+
+_orig_ee_init = _PatchExtractedEdges.__init__
+
+def _patched_ee_init(self, **data):
+    _orig_ee_init(self, **data)
+    for edge in self.edges:
+        if not edge.fact:
+            edge.fact = f'{edge.source_entity_name} {edge.relation_type} {edge.target_entity_name}'
+
+_PatchExtractedEdges.__init__ = _patched_ee_init
+
 from graphiti_zep.utils import (
     resolve_schema_refs as _resolve_schema_refs,
     fix_field_names as _fix_field_names,
@@ -145,11 +161,15 @@ class Settings(BaseSettings):
     embedding_base_url: str | None = None
     embedding_model_name: str | None = None
     embedding_batch_size: int = 0  # 0 = no limit; set to 10 for DashScope
+    ingest_retry_max_attempts: int = 1
+    ingest_retry_base_delay_seconds: int = 5
+    ingest_retry_max_delay_seconds: int = 15
     host: str = "127.0.0.1"
     port: int = 8000
     data_dir: str = "data"
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # Load .env (local overrides) first, then fall back to root ../.env for shared keys
+    model_config = SettingsConfigDict(env_file=(".env", "../.env"), extra="ignore")
 
     def validate_config(self) -> list[str]:
         """Validate configuration and return list of errors."""
@@ -162,19 +182,25 @@ class Settings(BaseSettings):
             errors.append("EMBEDDING_API_KEY is required")
         if self.llm_api_style.lower() not in ("openai", "anthropic"):
             errors.append(f"LLM_API_STYLE must be 'openai' or 'anthropic', got '{self.llm_api_style}'")
+        if self.ingest_retry_max_attempts < 1:
+            errors.append("INGEST_RETRY_MAX_ATTEMPTS must be >= 1")
+        if self.ingest_retry_base_delay_seconds < 0:
+            errors.append("INGEST_RETRY_BASE_DELAY_SECONDS must be >= 0")
+        if self.ingest_retry_max_delay_seconds < 0:
+            errors.append("INGEST_RETRY_MAX_DELAY_SECONDS must be >= 0")
         return errors
 
 
 SETTINGS = Settings()
 
-# Auto-map OPENAI_* env vars for graphiti-core compatibility.
-# graphiti-core reads OPENAI_API_KEY/OPENAI_BASE_URL internally for some codepaths.
-# If user only set LLM_*, we bridge them so graphiti-core can find them.
+# Auto-map OPENAI_API_KEY env var for graphiti-core compatibility.
+# graphiti-core reads OPENAI_API_KEY internally for some codepaths.
+# NOTE: We intentionally do NOT set OPENAI_BASE_URL here, because the embedder
+# uses the real OpenAI API and would break if pointed to a third-party LLM provider.
 import os as _os
-if SETTINGS.llm_api_key and not _os.environ.get("OPENAI_API_KEY"):
-    _os.environ["OPENAI_API_KEY"] = SETTINGS.llm_api_key
-if SETTINGS.llm_base_url and not _os.environ.get("OPENAI_BASE_URL"):
-    _os.environ["OPENAI_BASE_URL"] = SETTINGS.llm_base_url
+if SETTINGS.llm_api_style.lower() == "openai":
+    if SETTINGS.llm_api_key and not _os.environ.get("OPENAI_API_KEY"):
+        _os.environ["OPENAI_API_KEY"] = SETTINGS.llm_api_key
 
 APP_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = (APP_DIR / SETTINGS.data_dir).resolve()
@@ -411,8 +437,9 @@ async def _add_episode_with_retry(
     entity_types: dict[str, type[BaseModel]] | None,
     edge_types: dict[str, type[BaseModel]] | None,
     edge_type_map: dict[tuple[str, str], list[str]],
-    max_attempts: int = 6,
-    base_delay_seconds: int = 30,
+    max_attempts: int = 1,
+    base_delay_seconds: int = 5,
+    max_delay_seconds: int = 15,
 ):
     for attempt in range(1, max_attempts + 1):
         try:
@@ -429,7 +456,7 @@ async def _add_episode_with_retry(
         except Exception as exc:
             if not _is_retryable_error(exc) or attempt == max_attempts:
                 raise
-            delay = min(180, base_delay_seconds * (2 ** (attempt - 1)))
+            delay = min(max_delay_seconds, base_delay_seconds * (2 ** (attempt - 1)))
             logger.warning(
                 "Retryable error on episode %s for group %s: %s; retry in %ss (%s/%s)",
                 episode_index,
@@ -626,6 +653,9 @@ async def add_episode_batch(
                 entity_types=entity_types,
                 edge_types=edge_types,
                 edge_type_map=edge_type_map,
+                max_attempts=SETTINGS.ingest_retry_max_attempts,
+                base_delay_seconds=SETTINGS.ingest_retry_base_delay_seconds,
+                max_delay_seconds=SETTINGS.ingest_retry_max_delay_seconds,
             )
         except Exception as exc:
             logger.exception("Failed to add episode %s for group %s", index, group_id)

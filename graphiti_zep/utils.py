@@ -112,8 +112,33 @@ def fix_field_names(data: Any, schema: dict) -> Any:
     return data
 
 
+def _numeric_dict_to_list(data: dict) -> list:
+    """Convert a dict with numeric string keys to a list, parsing JSON string values."""
+    items = []
+    for k in sorted(data.keys(), key=lambda x: int(x)):
+        v = data[k]
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        items.append(v)
+    return items
+
+
+def _is_numeric_keyed_dict(data: dict) -> bool:
+    """Check if all keys in a dict are numeric strings (e.g. '0', '1', '2')."""
+    if not data:
+        return False
+    return all(k.isdigit() for k in data.keys())
+
+
 def unwrap_structured_payload(data: Any, schema: dict) -> Any:
-    """Unwrap provider-specific wrapper objects around the actual JSON payload."""
+    """Unwrap provider-specific wrapper objects around the actual JSON payload.
+
+    Also handles the case where the LLM returns a dict with numeric string keys
+    (e.g. {"0": ..., "1": ...}) instead of a proper array field.
+    """
     if not isinstance(data, dict):
         return data
 
@@ -141,6 +166,15 @@ def unwrap_structured_payload(data: Any, schema: dict) -> Any:
             only_value = next(iter(current.values()))
             if isinstance(only_value, dict):
                 nested = only_value
+
+        # Handle numeric-keyed dicts: {"0": {...}, "1": {...}} → wrap into expected array field
+        if nested is None and _is_numeric_keyed_dict(current):
+            props = schema.get("properties", {})
+            array_fields = [k for k, v in props.items()
+                           if isinstance(v, dict) and v.get("type") == "array"]
+            if array_fields:
+                items = _numeric_dict_to_list(current)
+                return {array_fields[0]: items}
 
         if nested is None:
             return current
