@@ -9,6 +9,7 @@ Or:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 from datetime import datetime, timezone
@@ -40,6 +41,8 @@ logger = logging.getLogger(__name__)
 # qwen-plus sometimes returns edges without the `fact` field. The vendored
 # graphiti_core source is patched to make fact default to '', and we also
 # hook ExtractedEdges.__init__ to auto-fill empty facts from edge metadata.
+from graphiti_core.prompts import extract_nodes as _prompt_extract_nodes
+from graphiti_core.prompts import summarize_nodes as _prompt_summarize_nodes
 from graphiti_core.prompts.extract_edges import ExtractedEdges as _PatchExtractedEdges
 
 _orig_ee_init = _PatchExtractedEdges.__init__
@@ -52,9 +55,79 @@ def _patched_ee_init(self, **data):
 
 _PatchExtractedEdges.__init__ = _patched_ee_init
 
+
+DEFAULT_OUTPUT_LANGUAGE = "zh-CN"
+_summary_language_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "graphiti_summary_language",
+    default="original",
+)
+LANGUAGE_INSTRUCTION = (
+    f"All free-form natural language output must be written in {DEFAULT_OUTPUT_LANGUAGE} Simplified Chinese. "
+    "This applies to summary and description fields only. "
+    "Keep entity names, model names, file names, IDs, relation_type values, and timestamps in their original form when needed. "
+    "Do not translate SCREAMING_SNAKE_CASE relation_type values or edge fact text."
+)
+
+
+def _append_language_instruction(messages: list[Any]) -> list[Any]:
+    if not messages:
+        return messages
+    if _summary_language_var.get() != DEFAULT_OUTPUT_LANGUAGE:
+        return messages
+
+    normalized = " ".join(
+        str(getattr(message, "content", "") or "") for message in messages
+    )
+    if LANGUAGE_INSTRUCTION in normalized:
+        return messages
+
+    last_message = messages[-1]
+    content = str(getattr(last_message, "content", "") or "").rstrip()
+    suffix = f"\n\nLANGUAGE REQUIREMENT:\n{LANGUAGE_INSTRUCTION}"
+    if hasattr(last_message, "model_copy"):
+        messages[-1] = last_message.model_copy(
+            update={"content": f"{content}{suffix}"}
+        )
+    else:
+        last_message.content = f"{content}{suffix}"
+    return messages
+
+
+def _patch_prompt_language(
+    module: Any,
+    function_names: tuple[str, ...],
+) -> None:
+    versions = getattr(module, "versions", None)
+
+    for function_name in function_names:
+        original = getattr(module, function_name, None)
+        if original is None:
+            continue
+        if getattr(original, "_graphiti_zep_language_patched", False):
+            continue
+
+        def _wrapper(context: dict[str, Any], _original=original):
+            return _append_language_instruction(_original(context))
+
+        _wrapper._graphiti_zep_language_patched = True
+        setattr(module, function_name, _wrapper)
+        if isinstance(versions, dict):
+            versions[function_name] = _wrapper
+
+
+_patch_prompt_language(
+    _prompt_extract_nodes,
+    ("extract_summary", "extract_summaries_batch"),
+)
+_patch_prompt_language(
+    _prompt_summarize_nodes,
+    ("summarize_pair", "summarize_context", "summary_description"),
+)
+
 from graphiti_zep.utils import (
     resolve_schema_refs as _resolve_schema_refs,
     fix_field_names as _fix_field_names,
+    sanitize_structured_payload as _sanitize_structured_payload,
     unwrap_structured_payload as _unwrap_structured_payload,
 )
 
@@ -69,7 +142,7 @@ class ChatCompletionsClient(OpenAIClient):
     OpenAI-compatible provider (Moonshot, Qwen, etc.) works with graphiti-core.
     """
 
-    def __init__(self, config=None, cache=False, client=None, **kwargs):
+    def __init__(self, config=None, cache=False, client=None, max_concurrency: int = 0, disable_thinking: bool = False, **kwargs):
         super().__init__(config, cache, client, **kwargs)
         if config is None:
             from graphiti_core.llm_client.config import LLMConfig
@@ -79,6 +152,8 @@ class ChatCompletionsClient(OpenAIClient):
             base_url=config.base_url,
             timeout=300.0,
         )
+        self._semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency > 0 else None
+        self._disable_thinking = disable_thinking
 
     async def _create_structured_completion(
         self,
@@ -103,13 +178,23 @@ class ChatCompletionsClient(OpenAIClient):
             ),
         })
 
-        response = await self.client.chat.completions.create(
-            model=model,
-            messages=enhanced_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-        )
+        async def _do_create():
+            kwargs = dict(
+                model=model,
+                messages=enhanced_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+            if self._disable_thinking:
+                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            return await self.client.chat.completions.create(**kwargs)
+
+        if self._semaphore is not None:
+            async with self._semaphore:
+                response = await _do_create()
+        else:
+            response = await _do_create()
         body = response.choices[0].message.content or "{}"
 
         stripped = body.strip()
@@ -131,6 +216,7 @@ class ChatCompletionsClient(OpenAIClient):
             parsed = json.loads(content)
             parsed = _unwrap_structured_payload(parsed, parameters)
             parsed = _fix_field_names(parsed, parameters)
+            parsed = _sanitize_structured_payload(parsed, parameters)
             content = json.dumps(parsed)
         except (json.JSONDecodeError, TypeError):
             pass
@@ -160,6 +246,8 @@ class Settings(BaseSettings):
     embedding_api_key: str
     embedding_base_url: str | None = None
     embedding_model_name: str | None = None
+    llm_max_concurrency: int = 0
+    llm_disable_thinking: bool = False
     embedding_batch_size: int = 0  # 0 = no limit; set to 10 for DashScope
     ingest_retry_max_attempts: int = 1
     ingest_retry_base_delay_seconds: int = 5
@@ -248,6 +336,35 @@ def python_type(type_name: str | None) -> type[Any]:
     return str
 
 
+def parse_reference_time(raw_value: str | None) -> datetime | None:
+    if not raw_value:
+        return None
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    for fmt in (
+        "%Y/%m/%d (%a) %H:%M",
+        "%Y/%m/%d (%a) %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+    ):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
 def build_entity_models(ontology: dict[str, Any]) -> dict[str, type[BaseModel]]:
     entity_models: dict[str, type[BaseModel]] = {}
     for entity in ontology.get("entity_types", []):
@@ -297,6 +414,7 @@ def build_edge_type_map(ontology: dict[str, Any]) -> dict[tuple[str, str], list[
 # ── Serialization ──────────────────────────────────────────────────────
 
 def serialize_node(node: EntityNode | EpisodicNode) -> dict[str, Any]:
+    source = getattr(node, "source", None)
     return {
         "uuid_": getattr(node, "uuid", None) or getattr(node, "uuid_", ""),
         "name": getattr(node, "name", ""),
@@ -304,6 +422,9 @@ def serialize_node(node: EntityNode | EpisodicNode) -> dict[str, Any]:
         "labels": getattr(node, "labels", []),
         "summary": getattr(node, "summary", "") or "",
         "attributes": getattr(node, "attributes", {}) or {},
+        "content": getattr(node, "content", "") or "",
+        "source": str(source) if source is not None else "",
+        "source_description": getattr(node, "source_description", "") or "",
         "created_at": str(getattr(node, "created_at", "") or ""),
         "valid_at": str(getattr(node, "valid_at", "") or ""),
         "invalid_at": str(getattr(node, "invalid_at", "") or ""),
@@ -312,6 +433,12 @@ def serialize_node(node: EntityNode | EpisodicNode) -> dict[str, Any]:
 
 
 def serialize_edge(edge: EntityEdge) -> dict[str, Any]:
+    episodes = getattr(edge, "episodes", None) or getattr(edge, "episode_ids", None)
+    if episodes and not isinstance(episodes, list):
+        episodes = [str(episodes)]
+    elif episodes:
+        episodes = [str(episode) for episode in episodes]
+
     return {
         "uuid_": getattr(edge, "uuid", None) or getattr(edge, "uuid_", ""),
         "name": getattr(edge, "name", "") or "",
@@ -324,7 +451,26 @@ def serialize_edge(edge: EntityEdge) -> dict[str, Any]:
         "valid_at": str(getattr(edge, "valid_at", "") or ""),
         "invalid_at": str(getattr(edge, "invalid_at", "") or ""),
         "expired_at": str(getattr(edge, "expired_at", "") or ""),
+        "episodes": episodes or [],
     }
+
+
+def _count_outcome_graph_items(outcome: Any) -> tuple[int, int]:
+    """Return the entity node / edge counts extracted for one episode."""
+    nodes = getattr(outcome, "nodes", None) or []
+    edges = getattr(outcome, "edges", None) or []
+    return len(nodes), len(edges)
+
+
+def _validate_episode_outcome(outcome: Any, *, group_id: str, episode_index: int) -> tuple[int, int]:
+    """Fail fast when the extractor writes an episode but produces no graph facts."""
+    node_count, edge_count = _count_outcome_graph_items(outcome)
+    if node_count == 0 and edge_count == 0:
+        raise ValueError(
+            "Graphiti produced an empty extraction "
+            f"for group {group_id} episode {episode_index}: no nodes or edges"
+        )
+    return node_count, edge_count
 
 
 # ── Request/Response Models ────────────────────────────────────────────
@@ -343,6 +489,8 @@ class OntologyRequest(BaseModel):
 class EpisodeIn(BaseModel):
     content: str
     type: str = "text"
+    source_description: str | None = None
+    reference_time: str | None = None
 
 
 class EpisodeBatchRequest(BaseModel):
@@ -434,6 +582,8 @@ async def _add_episode_with_retry(
     group_id: str,
     episode_index: int,
     episode_content: str,
+    source_description: str | None,
+    reference_time: datetime | None,
     entity_types: dict[str, type[BaseModel]] | None,
     edge_types: dict[str, type[BaseModel]] | None,
     edge_type_map: dict[tuple[str, str], list[str]],
@@ -446,8 +596,8 @@ async def _add_episode_with_retry(
             return await graphiti.add_episode(
                 name=f"{group_id}-episode-{episode_index}",
                 episode_body=episode_content,
-                source_description="graphiti-zep batch import",
-                reference_time=datetime.now(timezone.utc),
+                source_description=source_description or "graphiti-zep batch import",
+                reference_time=reference_time or datetime.now(timezone.utc),
                 group_id=group_id,
                 entity_types=entity_types or None,
                 edge_types=edge_types or None,
@@ -499,7 +649,7 @@ def build_graphiti() -> Graphiti:
         )
         llm_client = AnthropicClient(config=llm_config, client=anthropic_client)
     elif llm_style == "openai":
-        llm_client = ChatCompletionsClient(config=llm_config)
+        llm_client = ChatCompletionsClient(config=llm_config, max_concurrency=SETTINGS.llm_max_concurrency, disable_thinking=SETTINGS.llm_disable_thinking)
     else:
         raise ValueError(f"Unsupported LLM_API_STYLE: {SETTINGS.llm_api_style}")
 
@@ -592,6 +742,23 @@ async def healthcheck() -> JSONResponse:
 
 # ── Routes: Groups ────────────────────────────────────────────────────
 
+@app.get("/v1/groups")
+async def list_groups(_: None = Depends(require_auth)) -> list[dict[str, Any]]:
+    """Return all known groups."""
+    groups = load_json(GROUPS_FILE)
+    return list(groups.values())
+
+
+@app.get("/v1/groups/{group_id}")
+async def get_group(group_id: str, _: None = Depends(require_auth)) -> dict[str, Any]:
+    """Return a single group by ID."""
+    groups = load_json(GROUPS_FILE)
+    group = groups.get(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    return group
+
+
 @app.post("/v1/groups")
 async def create_group(payload: GroupCreateRequest, _: None = Depends(require_auth)) -> dict[str, Any]:
     groups = load_json(GROUPS_FILE)
@@ -628,8 +795,24 @@ async def set_ontology(
 async def add_episode_batch(
     group_id: str,
     payload: EpisodeBatchRequest,
+    x_graphiti_summary_language: str | None = Header(
+        default=None,
+        alias="X-Graphiti-Summary-Language",
+    ),
     _: None = Depends(require_auth),
 ) -> list[dict[str, Any]]:
+    requested_summary_language = (
+        (x_graphiti_summary_language or "original").strip() or "original"
+    )
+    if requested_summary_language not in {"original", DEFAULT_OUTPUT_LANGUAGE}:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported X-Graphiti-Summary-Language. "
+                f"Expected 'original' or '{DEFAULT_OUTPUT_LANGUAGE}'."
+            ),
+        )
+
     groups = load_json(GROUPS_FILE)
     group = groups.get(group_id)
     if not group:
@@ -641,40 +824,53 @@ async def add_episode_batch(
 
     graphiti = get_graphiti()
     results: list[dict[str, Any]] = []
-    for index, episode in enumerate(payload.episodes, start=1):
-        if index > 1:
-            await asyncio.sleep(1)
-        try:
-            outcome = await _add_episode_with_retry(
-                graphiti,
-                group_id=group_id,
-                episode_index=index,
-                episode_content=episode.content,
-                entity_types=entity_types,
-                edge_types=edge_types,
-                edge_type_map=edge_type_map,
-                max_attempts=SETTINGS.ingest_retry_max_attempts,
-                base_delay_seconds=SETTINGS.ingest_retry_base_delay_seconds,
-                max_delay_seconds=SETTINGS.ingest_retry_max_delay_seconds,
+    language_token = _summary_language_var.set(requested_summary_language)
+    try:
+        for index, episode in enumerate(payload.episodes, start=1):
+            if index > 1:
+                await asyncio.sleep(1)
+            try:
+                outcome = await _add_episode_with_retry(
+                    graphiti,
+                    group_id=group_id,
+                    episode_index=index,
+                    episode_content=episode.content,
+                    source_description=episode.source_description,
+                    reference_time=parse_reference_time(episode.reference_time),
+                    entity_types=entity_types,
+                    edge_types=edge_types,
+                    edge_type_map=edge_type_map,
+                    max_attempts=SETTINGS.ingest_retry_max_attempts,
+                    base_delay_seconds=SETTINGS.ingest_retry_base_delay_seconds,
+                    max_delay_seconds=SETTINGS.ingest_retry_max_delay_seconds,
+                )
+                node_count, edge_count = _validate_episode_outcome(
+                    outcome,
+                    group_id=group_id,
+                    episode_index=index,
+                )
+            except Exception as exc:
+                logger.exception("Failed to add episode %s for group %s", index, group_id)
+                status_code = 429 if _is_retryable_error(exc) else 500
+                detail_prefix = (
+                    "Graphiti batch ingest rate-limited"
+                    if status_code == 429
+                    else "Graphiti batch ingest failed"
+                )
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"{detail_prefix} for episode {index}: {exc}",
+                ) from exc
+            results.append(
+                {
+                    "uuid_": outcome.episode.uuid,
+                    "processed": True,
+                    "node_count": node_count,
+                    "edge_count": edge_count,
+                }
             )
-        except Exception as exc:
-            logger.exception("Failed to add episode %s for group %s", index, group_id)
-            status_code = 429 if _is_retryable_error(exc) else 500
-            detail_prefix = (
-                "Graphiti batch ingest rate-limited"
-                if status_code == 429
-                else "Graphiti batch ingest failed"
-            )
-            raise HTTPException(
-                status_code=status_code,
-                detail=f"{detail_prefix} for episode {index}: {exc}",
-            ) from exc
-        results.append(
-            {
-                "uuid_": outcome.episode.uuid,
-                "processed": True,
-            }
-        )
+    finally:
+        _summary_language_var.reset(language_token)
     return results
 
 
